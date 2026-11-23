@@ -1,0 +1,216 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>空中琴弦 · AR 手勢彈奏</title>
+<style>
+:root{--bg:#070b12;--ink:#e8f1ee;--dim:#8fa39d;--acc:#5cf2a6;--panel:rgba(10,16,24,.72)}
+*{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+html,body{margin:0;height:100%;background:var(--bg);color:var(--ink);font-family:"Noto Sans TC","PingFang TC","Microsoft JhengHei",system-ui,sans-serif;overflow:hidden;touch-action:none}
+canvas{position:fixed;left:0;top:0;width:100%;height:100%;display:block}
+video{position:fixed;width:1px;height:1px;opacity:0;pointer-events:none}
+.chip{position:fixed;top:max(10px,env(safe-area-inset-top));left:10px;padding:6px 12px;border-radius:8px;background:var(--panel);border:1px solid rgba(92,242,166,.35);font-size:clamp(11px,2.8vw,13px);color:var(--acc);backdrop-filter:blur(6px)}
+.bar{position:fixed;left:50%;transform:translateX(-50%);bottom:max(12px,env(safe-area-inset-bottom));display:flex;gap:8px;flex-wrap:wrap;justify-content:center;width:calc(100% - 20px);max-width:560px}
+.bar button{flex:1 1 auto;min-width:72px;padding:11px 12px;border-radius:10px;border:1px solid rgba(255,255,255,.18);background:var(--panel);color:var(--ink);font:inherit;font-size:clamp(13px,3.4vw,15px);backdrop-filter:blur(6px);cursor:pointer}
+.bar button.on{border-color:var(--acc);color:var(--acc)}
+.bar button:focus-visible,#start:focus-visible{outline:2px solid var(--acc);outline-offset:2px}
+.hint{position:fixed;left:10px;right:10px;bottom:calc(max(12px,env(safe-area-inset-bottom)) + 64px);text-align:center;font-size:clamp(11px,2.8vw,13px);color:var(--dim);pointer-events:none;text-shadow:0 1px 6px #000}
+#intro{position:fixed;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:14px;background:rgba(7,11,18,.88);text-align:center;padding:24px;z-index:5}
+#intro h1{margin:0;font-size:clamp(26px,7vw,44px);font-weight:700;letter-spacing:.04em}
+#intro p{margin:0;max-width:30em;color:var(--dim);line-height:1.7;font-size:clamp(13px,3.4vw,16px)}
+#start{margin-top:8px;padding:14px 32px;border-radius:12px;border:0;background:var(--acc);color:#04130c;font:inherit;font-weight:700;font-size:17px;cursor:pointer}
+#start.alt{background:transparent;color:var(--ink);border:1px solid rgba(255,255,255,.25);font-weight:500;font-size:14px;padding:10px 20px}
+@media (prefers-reduced-motion:reduce){*{transition:none!important}}
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<video id="v" playsinline muted></video>
+<div class="chip" id="chip">待機中</div>
+<div class="hint" id="hint"></div>
+<div class="bar">
+  <button id="bMode">模式：撥弦</button>
+  <button id="bCam" class="on">鏡頭：開</button>
+  <button id="bClear">清空琴弦</button>
+  <button id="bReset">預設琴弦</button>
+</div>
+<div id="intro">
+  <h1>空中琴弦</h1>
+  <p>用手機或筆電鏡頭追蹤雙手：<br>拇指與食指捏合，在空中拉出一條琴弦；捏住兩端錨點可改變長度與音高；手指劃過琴弦即可撥奏。沒有鏡頭時，可用滑鼠或觸控操作。</p>
+  <button id="start">開啟鏡頭並開始</button>
+  <button id="startNo" class="alt">不用鏡頭，直接彈奏</button>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands@0.4.1675469240/hands.js" crossorigin="anonymous"></script>
+<script>
+(()=>{
+const $=s=>document.querySelector(s);
+const cv=$('#c'),g=cv.getContext('2d'),vid=$('#v'),chip=$('#chip'),hint=$('#hint');
+let W,H,DPR;
+function resize(){DPR=Math.min(devicePixelRatio||1,2);W=innerWidth;H=innerHeight;cv.width=W*DPR;cv.height=H*DPR}
+addEventListener('resize',()=>{resize();S.forEach(pitchOf)});resize();
+
+/* ---------- 音訊：Karplus-Strong 物理泛音合成 ---------- */
+let ac,master;const cache={};
+const NAMES=['C','C#','D','D#','E','F','F#','G','G#','A','A#','B'];
+function initAudio(){if(ac)return;ac=new (window.AudioContext||window.webkitAudioContext)();master=ac.createGain();master.gain.value=.55;
+  const comp=ac.createDynamicsCompressor();master.connect(comp);comp.connect(ac.destination)}
+function ksBuffer(midi){
+  if(cache[midi])return cache[midi];
+  const f=440*Math.pow(2,(midi-69)/12),sr=ac.sampleRate,N=Math.max(2,Math.round(sr/f)),len=Math.floor(sr*2.6);
+  const buf=ac.createBuffer(1,len,sr),d=buf.getChannelData(0),ring=new Float32Array(N);
+  for(let i=0;i<N;i++)ring[i]=Math.random()*2-1;
+  const decay=midi>84?.990:.996;let p=0;
+  for(let i=0;i<len;i++){const n=(p+1)%N;d[i]=ring[p];ring[p]=(ring[p]+ring[n])*.5*decay;p=n}
+  return cache[midi]=buf}
+function playNote(midi,vel){
+  if(!ac)return;const src=ac.createBufferSource(),gn=ac.createGain();
+  src.buffer=ksBuffer(midi);gn.gain.value=vel;src.connect(gn);gn.connect(master);src.start()}
+
+/* ---------- 琴弦資料（座標以 0~1 正規化） ---------- */
+let S=[];const HUES=[150,265,45,330,190,20];let hueI=0;
+const ref=()=>Math.min(W,H)*.5;
+function pitchOf(s){
+  const L=Math.hypot((s.bx-s.ax)*W,(s.by-s.ay)*H);
+  const f=220*ref()/Math.max(L,20);
+  const midi=Math.max(33,Math.min(100,Math.round(69+12*Math.log2(f/440))));
+  s.L=L;s.midi=midi;s.hz=440*Math.pow(2,(midi-69)/12);
+  s.name=NAMES[midi%12]+(Math.floor(midi/12)-1);s.cm=L/(Math.min(W,H)/18)}
+function addString(ax,ay,bx,by){
+  const s={ax,ay,bx,by,hue:HUES[hueI++%HUES.length],amp:0,t0:0,cool:0};pitchOf(s);S.push(s);status();return s}
+function presets(){
+  S=[];const P=H>W?
+   [[.12,.20,.60,.16],[.20,.32,.88,.28],[.14,.44,.50,.40],[.40,.54,.88,.50],[.12,.64,.46,.60],[.54,.64,.88,.68]]:
+   [[.12,.30,.52,.24],[.18,.46,.78,.42],[.30,.56,.60,.52],[.14,.70,.40,.66],[.58,.66,.90,.60],[.70,.28,.88,.34]];
+  P.forEach(p=>addString(...p))}
+function status(){
+  chip.textContent=(camOn&&hands.length?'AR 雙手骨架追蹤運行中':camOn?'鏡頭已開啟，請將手放入畫面':'滑鼠／觸控模式')+' · '+S.length+' 條懸浮弦'}
+
+/* ---------- 幾何 ---------- */
+function cross(ax,ay,bx,by,cx,cy,dx,dy){
+  const d=(bx-ax)*(dy-cy)-(by-ay)*(dx-cx);if(!d)return false;
+  const t=((cx-ax)*(dy-cy)-(cy-ay)*(dx-cx))/d,u=((cx-ax)*(by-ay)-(cy-ay)*(bx-ax))/d;
+  return t>=0&&t<=1&&u>=0&&u<=1}
+const parts=[];
+function pluck(s,vel,x,y){
+  const now=performance.now();if(now-s.cool<110)return;s.cool=now;
+  s.amp=8+vel*22;s.t0=now;playNote(s.midi,.25+vel*.6);
+  for(let i=0;i<10;i++)parts.push({x,y,vx:(Math.random()-.5)*3,vy:(Math.random()-.5)*3,l:1,h:s.hue})}
+const prev={};
+function tipMove(id,x,y,allowPluck){
+  const p=prev[id];prev[id]={x,y};if(!p||!allowPluck)return;
+  const sp=Math.hypot(x-p.x,y-p.y);if(sp<2)return;
+  for(const s of S)if(cross(p.x,p.y,x,y,s.ax*W,s.ay*H,s.bx*W,s.by*H))pluck(s,Math.min(1,sp/50),x,y)}
+
+/* ---------- 捏合：拉弦 / 拖曳錨點 ---------- */
+const grabs={};let drafts=[];
+function pinchUpdate(id,x,y,isPinch,allowDraft){
+  let gr=grabs[id];
+  if(isPinch&&!gr){
+    let best=null,bd=38;
+    for(const s of S)for(const e of['a','b']){const d=Math.hypot(s[e+'x']*W-x,s[e+'y']*H-y);if(d<bd){bd=d;best={s,e}}}
+    if(best)gr=grabs[id]=best;else if(allowDraft)gr=grabs[id]={draft:{x,y},cur:{x,y}}}
+  if(isPinch&&gr){
+    if(gr.s){gr.s[gr.e+'x']=x/W;gr.s[gr.e+'y']=y/H;pitchOf(gr.s)}else gr.cur={x,y}}
+  if(!isPinch&&gr){
+    if(gr.draft&&Math.hypot(gr.cur.x-gr.draft.x,gr.cur.y-gr.draft.y)>40)
+      addString(gr.draft.x/W,gr.draft.y/H,gr.cur.x/W,gr.cur.y/H);
+    delete grabs[id]}}
+
+/* ---------- 滑鼠／觸控 ---------- */
+let mode='pluck';
+const ptr={};
+cv.addEventListener('pointerdown',e=>{cv.setPointerCapture(e.pointerId);initAudio();ac&&ac.resume();ptr[e.pointerId]=true;
+  prev['p'+e.pointerId]=null;pinchUpdate('p'+e.pointerId,e.clientX,e.clientY,true,mode==='draw')});
+cv.addEventListener('pointermove',e=>{
+  const id='p'+e.pointerId,down=ptr[e.pointerId];
+  if(down)pinchUpdate(id,e.clientX,e.clientY,true,mode==='draw');
+  tipMove(id,e.clientX,e.clientY,mode==='pluck'&&(down||e.pointerType==='mouse')&&!(grabs[id]&&grabs[id].s))});
+const up=e=>{const id='p'+e.pointerId;pinchUpdate(id,e.clientX,e.clientY,false);delete ptr[e.pointerId];delete prev[id]};
+cv.addEventListener('pointerup',up);cv.addEventListener('pointercancel',up);
+
+/* ---------- 手勢追蹤（MediaPipe Hands） ---------- */
+let camOn=false,hands=[],model,busy=false,stream,vw=640,vh=480;
+const CONN=[[0,1],[1,2],[2,3],[3,4],[0,5],[5,6],[6,7],[7,8],[5,9],[9,10],[10,11],[11,12],[9,13],[13,14],[14,15],[15,16],[13,17],[17,18],[18,19],[19,20],[0,17]];
+function mapLM(l){const sc=Math.max(W/vw,H/vh),ox=(W-vw*sc)/2,oy=(H-vh*sc)/2;return{x:W-(ox+l.x*vw*sc),y:oy+l.y*vh*sc}}
+function onResults(r){
+  const list=(r.multiHandLandmarks||[]);
+  hands=list.map((lm,hi)=>{
+    const p=lm.map(mapLM),size=Math.hypot(p[0].x-p[9].x,p[0].y-p[9].y)||1;
+    const pd=Math.hypot(p[4].x-p[8].x,p[4].y-p[8].y),pinch=pd<size*.32;
+    const mx=(p[4].x+p[8].x)/2,my=(p[4].y+p[8].y)/2;
+    pinchUpdate('h'+hi,mx,my,pinch,true);
+    [4,8,12,16,20].forEach(k=>tipMove('h'+hi+'t'+k,p[k].x,p[k].y,!pinch));
+    return{p,pinch,mx,my}});
+  for(let hi=list.length;hi<2;hi++){pinchUpdate('h'+hi,0,0,false)}
+  status()}
+async function startCam(){
+  if(typeof Hands==='undefined'){chip.textContent='手勢模型載入失敗，已改用滑鼠／觸控';return false}
+  try{
+    stream=await navigator.mediaDevices.getUserMedia({video:{facingMode:'user',width:{ideal:640},height:{ideal:480}},audio:false});
+    vid.srcObject=stream;await vid.play();vw=vid.videoWidth||640;vh=vid.videoHeight||480;
+    if(!model){model=new Hands({locateFile:f=>'https://cdn.jsdelivr.net/npm/@mediapipe/hands@0.4.1675469240/'+f});
+      model.setOptions({maxNumHands:2,modelComplexity:1,minDetectionConfidence:.6,minTrackingConfidence:.5});model.onResults(onResults)}
+    camOn=true;chip.textContent='載入手勢模型中…';camLoop();return true
+  }catch(e){camOn=false;chip.textContent='無法使用鏡頭（需 https 與授權），改用滑鼠／觸控';return false}}
+function stopCam(){camOn=false;hands=[];if(stream)stream.getTracks().forEach(t=>t.stop());stream=null;status()}
+async function camLoop(){
+  if(!camOn)return;
+  if(vid.readyState>=2&&!busy){busy=true;try{vw=vid.videoWidth;vh=vid.videoHeight;await model.send({image:vid})}catch(e){}busy=false}
+  requestAnimationFrame(camLoop)}
+
+/* ---------- 繪製 ---------- */
+function drawString(s,t){
+  const ax=s.ax*W,ay=s.ay*H,bx=s.bx*W,by=s.by*H,mx=(ax+bx)/2,my=(ay+by)/2;
+  const nx=-(by-ay)/s.L,ny=(bx-ax)/s.L,age=(t-s.t0)/1000;
+  const a=s.amp*Math.exp(-age*3.4)*Math.sin(age*70),col=`hsl(${s.hue} 90% 62%)`;
+  g.lineCap='round';g.strokeStyle=col;g.shadowColor=col;g.shadowBlur=14;g.lineWidth=2.4;
+  g.beginPath();g.moveTo(ax,ay);g.quadraticCurveTo(mx+nx*a*2,my+ny*a*2,bx,by);g.stroke();
+  g.shadowBlur=0;g.lineWidth=1;g.globalAlpha=.55;
+  for(let k=-1;k<=1;k+=2){g.beginPath();g.moveTo(ax,ay);g.quadraticCurveTo(mx+nx*(a*2+k*3),my+ny*(a*2+k*3),bx,by);g.stroke()}
+  g.globalAlpha=1;
+  for(const[x,y]of[[ax,ay],[bx,by]]){g.fillStyle='#0a1018';g.strokeStyle=col;g.lineWidth=2;g.beginPath();g.arc(x,y,7,0,7);g.fill();g.stroke()}
+  const label=`${s.name} · ${Math.round(s.hz)}Hz · ${s.cm.toFixed(0)}cm`;
+  g.font='600 12px system-ui,sans-serif';const w=g.measureText(label).width+14;
+  g.save();g.translate(mx,my);let ang=Math.atan2(by-ay,bx-ax);if(ang>Math.PI/2||ang<-Math.PI/2)ang+=Math.PI;g.rotate(ang);
+  g.translate(0,-16);g.fillStyle='rgba(8,14,22,.8)';g.strokeStyle=col;g.lineWidth=1;g.beginPath();g.roundRect(-w/2,-10,w,20,5);g.fill();g.stroke();
+  g.fillStyle='#e8f1ee';g.textAlign='center';g.textBaseline='middle';g.fillText(label,0,0);g.restore()}
+function drawHand(h){
+  g.lineWidth=2;g.strokeStyle='#3ddc84';
+  for(const[i,j]of CONN){g.beginPath();g.moveTo(h.p[i].x,h.p[i].y);g.lineTo(h.p[j].x,h.p[j].y);g.stroke()}
+  g.fillStyle='#ff3b4a';for(const q of h.p){g.beginPath();g.arc(q.x,q.y,3.2,0,7);g.fill()}
+  if(h.pinch){g.strokeStyle='#ffd23f';g.lineWidth=2.5;g.beginPath();g.arc(h.mx,h.my,14,0,7);g.stroke()}}
+function frame(t){
+  g.setTransform(DPR,0,0,DPR,0,0);g.clearRect(0,0,W,H);
+  if(camOn&&vid.readyState>=2){
+    const sc=Math.max(W/vw,H/vh),ox=(W-vw*sc)/2,oy=(H-vh*sc)/2;
+    g.save();g.translate(W,0);g.scale(-1,1);g.drawImage(vid,ox,oy,vw*sc,vh*sc);g.restore();
+    g.fillStyle='rgba(5,8,14,.5)';g.fillRect(0,0,W,H)
+  }else{const gr=g.createRadialGradient(W/2,H*.4,0,W/2,H*.4,Math.max(W,H)*.8);gr.addColorStop(0,'#0f1a26');gr.addColorStop(1,'#05080d');g.fillStyle=gr;g.fillRect(0,0,W,H)}
+  for(const s of S)drawString(s,t);
+  for(const k in grabs){const d=grabs[k];if(d.draft){g.strokeStyle='#ffd23f';g.setLineDash([6,6]);g.lineWidth=2;g.beginPath();g.moveTo(d.draft.x,d.draft.y);g.lineTo(d.cur.x,d.cur.y);g.stroke();g.setLineDash([])}}
+  for(let i=parts.length-1;i>=0;i--){const p=parts[i];p.x+=p.vx;p.y+=p.vy;p.l-=.03;if(p.l<=0){parts.splice(i,1);continue}
+    g.globalAlpha=p.l;g.fillStyle=`hsl(${p.h} 95% 70%)`;g.fillRect(p.x,p.y,2.5,2.5)}
+  g.globalAlpha=1;
+  for(const h of hands)drawHand(h);
+  requestAnimationFrame(frame)}
+
+/* ---------- UI ---------- */
+function setHint(){hint.textContent=camOn?'捏合拇指＋食指拉出新弦・捏住錨點調音高・指尖劃過琴弦撥奏':(mode==='pluck'?'滑鼠／手指劃過琴弦撥奏・拖曳錨點改變音高':'在空白處拖曳拉出新琴弦')}
+$('#bMode').onclick=e=>{mode=mode==='pluck'?'draw':'pluck';e.target.textContent='模式：'+(mode==='pluck'?'撥弦':'拉弦');e.target.classList.toggle('on',mode==='draw');setHint()};
+$('#bCam').onclick=async e=>{if(camOn){stopCam();e.target.textContent='鏡頭：關';e.target.classList.remove('on')}else{initAudio();if(await startCam()){e.target.textContent='鏡頭：開';e.target.classList.add('on')}}setHint()};
+$('#bClear').onclick=()=>{S=[];status()};
+$('#bReset').onclick=()=>{hueI=0;presets();status()};
+async function begin(useCam){
+  initAudio();await ac.resume();$('#intro').remove();
+  const b=$('#bCam');
+  if(useCam&&await startCam()){b.textContent='鏡頭：開';b.classList.add('on')}else{b.textContent='鏡頭：關';b.classList.remove('on')}
+  setHint();status()}
+$('#start').onclick=()=>begin(true);
+$('#startNo').onclick=()=>begin(false);
+presets();status();setHint();requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>

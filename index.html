@@ -8,7 +8,7 @@
 :root{--bg:#070b12;--ink:#e8f1ee;--dim:#8fa39d;--acc:#5cf2a6;--panel:rgba(10,16,24,.72)}
 *{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
 html,body{margin:0;height:100%;background:var(--bg);color:var(--ink);font-family:"Noto Sans TC","PingFang TC","Microsoft JhengHei",system-ui,sans-serif;overflow:hidden;touch-action:none}
-canvas{position:fixed;inset:0;display:block}
+canvas{position:fixed;left:0;top:0;width:100%;height:100%;display:block}
 video{position:fixed;width:1px;height:1px;opacity:0;pointer-events:none}
 .chip{position:fixed;top:max(10px,env(safe-area-inset-top));left:10px;padding:6px 12px;border-radius:8px;background:var(--panel);border:1px solid rgba(92,242,166,.35);font-size:clamp(11px,2.8vw,13px);color:var(--acc);backdrop-filter:blur(6px)}
 .bar{position:fixed;left:50%;transform:translateX(-50%);bottom:max(12px,env(safe-area-inset-bottom));display:flex;gap:8px;flex-wrap:wrap;justify-content:center;width:calc(100% - 20px);max-width:560px}
@@ -49,7 +49,7 @@ const $=s=>document.querySelector(s);
 const cv=$('#c'),g=cv.getContext('2d'),vid=$('#v'),chip=$('#chip'),hint=$('#hint');
 let W,H,DPR;
 function resize(){DPR=Math.min(devicePixelRatio||1,2);W=innerWidth;H=innerHeight;cv.width=W*DPR;cv.height=H*DPR}
-addEventListener('resize',resize);resize();
+addEventListener('resize',()=>{resize();S.forEach(pitchOf)});resize();
 
 /* ---------- 音訊：Karplus-Strong 物理泛音合成 ---------- */
 let ac,master;const cache={};
@@ -80,8 +80,10 @@ function pitchOf(s){
 function addString(ax,ay,bx,by){
   const s={ax,ay,bx,by,hue:HUES[hueI++%HUES.length],amp:0,t0:0,cool:0};pitchOf(s);S.push(s);status();return s}
 function presets(){
-  S=[];[[.12,.30,.52,.24],[.18,.46,.78,.42],[.30,.56,.60,.52],[.14,.70,.40,.66],[.58,.66,.90,.60],[.70,.28,.88,.34]]
-   .forEach(p=>addString(...p))}
+  S=[];const P=H>W?
+   [[.12,.20,.60,.16],[.20,.32,.88,.28],[.14,.44,.50,.40],[.40,.54,.88,.50],[.12,.64,.46,.60],[.54,.64,.88,.68]]:
+   [[.12,.30,.52,.24],[.18,.46,.78,.42],[.30,.56,.60,.52],[.14,.70,.40,.66],[.58,.66,.90,.60],[.70,.28,.88,.34]];
+  P.forEach(p=>addString(...p))}
 function status(){
   chip.textContent=(camOn&&hands.length?'AR 雙手骨架追蹤運行中':camOn?'鏡頭已開啟，請將手放入畫面':'滑鼠／觸控模式')+' · '+S.length+' 條懸浮弦'}
 
